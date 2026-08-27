@@ -2,6 +2,7 @@ import logging
 import os
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Form
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.database.connection import get_db, DatabaseConnectionError
@@ -12,6 +13,65 @@ from backend.utils import file_safety
 logger = logging.getLogger("vibeguard.api.scans")
 
 router = APIRouter(prefix="/api", tags=["scans"])
+
+
+class SourceAnalysisRequest(BaseModel):
+    project_name: str
+    files: list[dict[str, str]]
+
+
+@router.post("/analyze", response_model=ReportDetailOut)
+def analyze_source(payload: SourceAnalysisRequest, db: Session = Depends(get_db)):
+    """Analyze source submitted directly by a user without executing it."""
+    project_name = payload.project_name.strip()
+    allowed_source_extensions = {".py", ".js", ".jsx", ".ts", ".tsx"}
+
+    if not project_name:
+        raise HTTPException(status_code=400, detail="project_name is required.")
+    if not payload.files:
+        raise HTTPException(status_code=400, detail="At least one source file is required.")
+
+    workspace_dir = file_safety.new_workspace()
+    try:
+        total_size = 0
+        for source in payload.files:
+            filename = source.get("filename", "").replace("\\", "/").lstrip("/")
+            extension = os.path.splitext(filename)[1].lower()
+            source_code = source.get("source_code", "")
+            if extension not in allowed_source_extensions:
+                raise HTTPException(status_code=400, detail=f"Unsupported source extension: {extension}")
+            if not filename or any(part in {"", ".", ".."} for part in filename.split("/")):
+                raise HTTPException(status_code=400, detail="Source filename contains an unsafe path.")
+            if not source_code.strip():
+                raise HTTPException(status_code=400, detail=f"Source code is empty: {filename}")
+            total_size += len(source_code.encode("utf-8"))
+            source_path = os.path.join(workspace_dir, filename)
+            os.makedirs(os.path.dirname(source_path), exist_ok=True)
+            with open(source_path, "w", encoding="utf-8") as source_file:
+                source_file.write(source_code)
+        file_safety.validate_upload_size(total_size)
+
+        try:
+            report = run_full_scan(
+                db=db,
+                project_name=project_name,
+                workspace_dir=workspace_dir,
+            )
+        except DatabaseConnectionError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+        db.commit()
+        db.refresh(report)
+        return report
+    except file_safety.UnsafeUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Source analysis failed unexpectedly.")
+        raise HTTPException(status_code=500, detail="The source could not be analyzed.")
+    finally:
+        file_safety.cleanup_workspace(workspace_dir)
 
 
 @router.post("/scan", response_model=ReportDetailOut)

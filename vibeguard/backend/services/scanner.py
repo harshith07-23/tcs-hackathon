@@ -363,6 +363,49 @@ def _check_python_ast_issues(files: List[str]) -> List[RawFinding]:
         except (OSError, SyntaxError):
             continue
 
+        request_values = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
+                continue
+            source = value.func.value
+            if (
+                isinstance(source, ast.Attribute)
+                and isinstance(source.value, ast.Name)
+                and source.value.id == "request"
+                and source.attr in {"args", "form", "values", "json"}
+            ):
+                request_values.update(
+                    target.id for target in node.targets if isinstance(target, ast.Name)
+                )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Return) or not isinstance(node.value, ast.JoinedStr):
+                continue
+            interpolated_names = {
+                formatted.value.id
+                for formatted in node.value.values
+                if isinstance(formatted, ast.FormattedValue)
+                and isinstance(formatted.value, ast.Name)
+            }
+            if request_values.intersection(interpolated_names):
+                findings.append(
+                    RawFinding(
+                        title="Reflected XSS in HTML response",
+                        category="xss",
+                        severity="MEDIUM",
+                        confidence=85,
+                        file_path=path,
+                        line_number=node.lineno,
+                        description="Request data is interpolated into an HTML response without output encoding.",
+                        impact="An attacker can inject JavaScript into the response and execute it in a victim's browser.",
+                        recommendation="Render the value through a template engine with autoescaping, or HTML-escape it before returning the response.",
+                        source_tool="vibeguard-ast",
+                    )
+                )
+
         for node in ast.walk(tree):
             if isinstance(node, ast.ExceptHandler) and node.type is None:
                 body_is_pass_only = all(isinstance(n, ast.Pass) for n in node.body)

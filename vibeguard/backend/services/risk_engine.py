@@ -24,6 +24,12 @@ SEVERITY_WEIGHT = {
 }
 
 SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+MIN_SECURITY_SCORE = {
+    "CRITICAL": 24,
+    "HIGH": 49,
+    "MEDIUM": 74,
+    "LOW": 89,
+}
 
 
 @dataclass
@@ -52,10 +58,13 @@ def _posture_for_score(score: int) -> str:
 def calculate_score(findings: List[RawFinding]) -> ScoreBreakdown:
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     penalty = 0.0
+    highest_severity = None
 
     for f in findings:
         severity = f.severity if f.severity in counts else "MEDIUM"
         counts[severity] += 1
+        if highest_severity is None or SEVERITY_ORDER.index(severity) < SEVERITY_ORDER.index(highest_severity):
+            highest_severity = severity
 
         base_weight = SEVERITY_WEIGHT[severity]
         confidence_factor = max(0.3, min(1.0, f.confidence / 100))
@@ -70,6 +79,8 @@ def calculate_score(findings: List[RawFinding]) -> ScoreBreakdown:
         penalty += finding_penalty
 
     score = round(max(0.0, 100.0 - penalty))
+    if highest_severity:
+        score = min(score, MIN_SECURITY_SCORE[highest_severity])
     score = max(0, min(100, score))
 
     total = sum(counts.values())
