@@ -94,7 +94,7 @@ export default function Page() {
               </p>
             </div>
           </div>
-          <ArchitectureGraph riskScore={riskScore} />
+          <ArchitectureGraph findings={report?.findings ?? []} />
         </div>
       </section>
 

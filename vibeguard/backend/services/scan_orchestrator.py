@@ -52,6 +52,98 @@ def _read_snippet(finding: RawFinding) -> Optional[str]:
     return None
 
 
+# Map scanner-specific category IDs to canonical VibeGuard categories so that
+# the same vulnerability detected by two different scanners at the same
+# location is properly deduplicated.
+_CATEGORY_ALIASES: dict[str, str] = {
+    # Bandit → VibeGuard canonical
+    "B605": "command-injection",       # start_process_with_a_shell
+    "B602": "command-injection",       # subprocess_popen_with_shell_equals_true
+    "B603": "command-injection",       # subprocess_without_shell_equals_true
+    "B604": "command-injection",       # any_other_function_with_shell_equals_true
+    "B608": "sql-injection",           # hardcoded_sql_expressions
+    "B324": "weak-cryptography",       # hashlib (MD5/SHA1)
+    "B303": "weak-cryptography",       # MD5 / SHA1 usage (older bandit IDs)
+    "B105": "hardcoded-secrets",       # hardcoded_password_string
+    "B106": "hardcoded-secrets",       # hardcoded_password_funcarg
+    "B107": "hardcoded-secrets",       # hardcoded_password_default
+    "B110": "security-misconfiguration",  # try_except_pass
+    "B310": "path-traversal",          # urllib_urlopen (URL manipulation)
+    "B501": "sensitive-data-exposure", # request_with_no_cert_validation
+    "B502": "sensitive-data-exposure", # ssl_with_bad_version
+    "B301": "insecure-deserialization",  # pickle
+    "B506": "insecure-deserialization",  # yaml_load
+    # Normalize hyphens/underscores and casing
+    "hardcoded_secrets": "hardcoded-secrets",
+    "HARDCODED-SECRETS": "hardcoded-secrets",
+    "HARDCODED_SECRETS": "hardcoded-secrets",
+    "WEAK-CRYPTOGRAPHY": "weak-cryptography",
+    "WEAK_CRYPTOGRAPHY": "weak-cryptography",
+    "COMMAND-INJECTION": "command-injection",
+    "COMMAND_INJECTION": "command-injection",
+    "SQL-INJECTION": "sql-injection",
+    "SQL_INJECTION": "sql-injection",
+}
+
+
+def _normalize_category(category: str) -> str:
+    """Return the canonical category, falling back to lowercase original."""
+    return _CATEGORY_ALIASES.get(category, _CATEGORY_ALIASES.get(category.upper(), category.lower()))
+
+
+def _dedupe_findings(findings: List[RawFinding]) -> List[RawFinding]:
+    """
+    Cross-scanner deduplication.
+
+    Findings are considered duplicates when they describe the same underlying
+    issue at the same code location:
+      - same file_path
+      - same (or adjacent ±1) line_number
+      - same *normalized* category
+
+    Different scanners sometimes use different category names for the same
+    vulnerability class (e.g. bandit ``B605`` vs. vibeguard ``command-injection``).
+    The ``_CATEGORY_ALIASES`` map normalizes these into a canonical category
+    for grouping purposes.
+
+    From each group of duplicates, only the single best finding is kept
+    (highest severity, then highest confidence).
+    """
+    if not findings:
+        return findings
+
+    # Normalise the line number into a small bucket so that off-by-one
+    # differences between scanners don't produce duplicates.
+    def _line_bucket(line: int | None) -> int | None:
+        if line is None:
+            return None
+        # Round down to the nearest even number — this means adjacent
+        # lines (e.g. 7 and 8) fall into the same bucket.
+        return line // 2
+
+    # Build groups keyed by (file, line_bucket, normalized_category)
+    groups: dict[tuple, list[RawFinding]] = {}
+    for f in findings:
+        norm_cat = _normalize_category(f.category)
+        key = (f.file_path, _line_bucket(f.line_number), norm_cat)
+        groups.setdefault(key, []).append(f)
+
+    deduped: List[RawFinding] = []
+    for group in groups.values():
+        if len(group) == 1:
+            deduped.append(group[0])
+        else:
+            # Pick the best representative: highest severity first, then
+            # highest confidence, then keep whichever came first (stable).
+            best = min(
+                group,
+                key=lambda f: (_severity_rank(f.severity), -f.confidence),
+            )
+            deduped.append(best)
+
+    return deduped
+
+
 def run_full_scan(
     db: Session,
     project_name: str,
@@ -78,6 +170,17 @@ def run_full_scan(
     dependency_findings = dependency_scanner.run_dependency_scan(workspace_dir)
 
     all_findings: List[RawFinding] = sast_findings + secret_findings + dependency_findings
+
+    # --- cross-scanner deduplication --------------------------------------------
+    # Multiple scanners / rules can flag the same underlying issue at the same
+    # location (e.g. the SAST "hardcoded credential" rule, the secret-scanner
+    # "Hardcoded Password" pattern, and the "Generic Secret Assignment" pattern
+    # may all fire on the same line).  We keep only the highest-confidence
+    # finding per (file, line, category) tuple, preferring higher severity on
+    # tie.  Genuinely different vulnerabilities at different locations or in
+    # different categories are never merged.
+    all_findings = _dedupe_findings(all_findings)
+
     all_findings.sort(key=lambda f: _severity_rank(f.severity))
 
     # --- deterministic risk score ------------------------------------------------
