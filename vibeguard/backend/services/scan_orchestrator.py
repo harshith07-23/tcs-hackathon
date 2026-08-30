@@ -148,11 +148,15 @@ def run_full_scan(
     db: Session,
     project_name: str,
     workspace_dir: str,
+    project_root: str | None = None,
     use_groq: bool = True,
 ) -> models.Report:
     start_time = time.time()
 
-    files = file_safety.list_source_files(workspace_dir)
+    # Use detected project root or fall back to workspace_dir
+    effective_root = project_root or workspace_dir
+
+    files = file_safety.list_source_files(effective_root)
     python_files = [f for f in files if f.endswith(".py")]
     js_files = [f for f in files if f.endswith((".js", ".jsx", ".ts", ".tsx"))]
     config_files = [
@@ -162,24 +166,23 @@ def run_full_scan(
             "Dockerfile", "docker-compose.yml", ".env", ".env.example",
         } or Path(f).suffix in {".yml", ".yaml"}
     ]
-    frameworks = detect_frameworks(workspace_dir)
+    frameworks = detect_frameworks(effective_root)
 
     # --- deterministic scanners -------------------------------------------------
-    sast_findings = scanner.run_static_analysis(workspace_dir, files)
-    secret_findings = secret_scanner.run_secret_scan(workspace_dir, files)
-    dependency_findings = dependency_scanner.run_dependency_scan(workspace_dir)
+    sast_findings = scanner.run_static_analysis(effective_root, files)
+    secret_findings = secret_scanner.run_secret_scan(effective_root, files)
+    dependency_findings = dependency_scanner.run_dependency_scan(effective_root)
 
     all_findings: List[RawFinding] = sast_findings + secret_findings + dependency_findings
 
     # --- cross-scanner deduplication --------------------------------------------
-    # Multiple scanners / rules can flag the same underlying issue at the same
-    # location (e.g. the SAST "hardcoded credential" rule, the secret-scanner
-    # "Hardcoded Password" pattern, and the "Generic Secret Assignment" pattern
-    # may all fire on the same line).  We keep only the highest-confidence
-    # finding per (file, line, category) tuple, preferring higher severity on
-    # tie.  Genuinely different vulnerabilities at different locations or in
-    # different categories are never merged.
     all_findings = _dedupe_findings(all_findings)
+
+    # --- normalize file paths to project-relative -------------------------------
+    for finding in all_findings:
+        finding.file_path = file_safety.normalize_finding_path(
+            finding.file_path, effective_root
+        )
 
     all_findings.sort(key=lambda f: _severity_rank(f.severity))
 

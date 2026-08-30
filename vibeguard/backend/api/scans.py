@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Form
 from pydantic import BaseModel
@@ -24,7 +25,6 @@ class SourceAnalysisRequest(BaseModel):
 def analyze_source(payload: SourceAnalysisRequest, db: Session = Depends(get_db)):
     """Analyze source submitted directly by a user without executing it."""
     project_name = payload.project_name.strip()
-    allowed_source_extensions = {".py", ".js", ".jsx", ".ts", ".tsx"}
 
     if not project_name:
         raise HTTPException(status_code=400, detail="project_name is required.")
@@ -36,14 +36,23 @@ def analyze_source(payload: SourceAnalysisRequest, db: Session = Depends(get_db)
         total_size = 0
         for source in payload.files:
             filename = source.get("filename", "").replace("\\", "/").lstrip("/")
-            extension = os.path.splitext(filename)[1].lower()
             source_code = source.get("source_code", "")
-            if extension not in allowed_source_extensions:
-                raise HTTPException(status_code=400, detail=f"Unsupported source extension: {extension}")
+            
             if not filename or any(part in {"", ".", ".."} for part in filename.split("/")):
                 raise HTTPException(status_code=400, detail="Source filename contains an unsafe path.")
+                
+            path_obj = Path(filename)
+            if any(part in file_safety.BLOCKED_DIR_NAMES for part in path_obj.parts):
+                continue
+
+            if not file_safety._is_allowed(path_obj):
+                # Skip unallowed files instead of failing the whole request
+                continue
+                
             if not source_code.strip():
-                raise HTTPException(status_code=400, detail=f"Source code is empty: {filename}")
+                # Skip empty files
+                continue
+                
             total_size += len(source_code.encode("utf-8"))
             source_path = os.path.join(workspace_dir, filename)
             os.makedirs(os.path.dirname(source_path), exist_ok=True)
@@ -51,11 +60,14 @@ def analyze_source(payload: SourceAnalysisRequest, db: Session = Depends(get_db)
                 source_file.write(source_code)
         file_safety.validate_upload_size(total_size)
 
+        project_root = file_safety.detect_project_root(workspace_dir)
+
         try:
             report = run_full_scan(
                 db=db,
                 project_name=project_name,
                 workspace_dir=workspace_dir,
+                project_root=project_root,
             )
         except DatabaseConnectionError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
@@ -67,9 +79,9 @@ def analyze_source(payload: SourceAnalysisRequest, db: Session = Depends(get_db)
         raise HTTPException(status_code=400, detail=str(exc))
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("Source analysis failed unexpectedly.")
-        raise HTTPException(status_code=500, detail="The source could not be analyzed.")
+        raise HTTPException(status_code=500, detail=f"The source could not be analyzed. Error: {str(exc)}")
     finally:
         file_safety.cleanup_workspace(workspace_dir)
 
@@ -103,11 +115,15 @@ async def create_scan(
         os.makedirs(extraction_dir, exist_ok=True)
         file_safety.safe_extract_zip(zip_path, extraction_dir)
 
+        # Detect the actual project root (handles wrapper directories)
+        project_root = file_safety.detect_project_root(extraction_dir)
+
         try:
             report = run_full_scan(
                 db=db,
                 project_name=project_name.strip(),
                 workspace_dir=extraction_dir,
+                project_root=project_root,
             )
         except DatabaseConnectionError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
@@ -129,3 +145,4 @@ async def create_scan(
         )
     finally:
         file_safety.cleanup_workspace(workspace_dir)
+

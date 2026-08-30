@@ -19,8 +19,16 @@ import type { ApiFinding } from '@/lib/threat-data'
 
 export type SeverityLevel = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO'
 
+export interface GraphFindingDetail {
+  id: string
+  title: string
+  severity: SeverityLevel
+  line: number | null
+}
+
 export interface GraphNode {
   id: string
+  type: 'area' | 'file'
   label: string
   kind: string
   x: number
@@ -28,18 +36,51 @@ export interface GraphNode {
   vulnerabilityCount: number
   highestSeverity: SeverityLevel
   vulnerabilities: string[]   // finding IDs
-  files: string[]             // unique file paths
+
+  // Area-specific
+  files?: string[]            // unique clean file paths
+
+  // File-specific
+  parentId?: string           // ID of the parent area node
+  fullPath?: string           // Clean project-relative path
+  findingsDetails?: GraphFindingDetail[] // Details for the hover tooltip
 }
 
 export interface GraphEdge {
   from: string
   to: string
   active: boolean             // true when either endpoint is CRITICAL or HIGH
+  isHierarchy?: boolean       // true if this is a Parent -> Child edge
 }
 
 export interface GraphData {
   nodes: GraphNode[]
   edges: GraphEdge[]
+}
+
+/* ------------------------------------------------------------------ */
+/*  Path Cleaning Utilities                                            */
+/* ------------------------------------------------------------------ */
+
+export function cleanFilePath(path: string): string {
+  if (!path) return 'unknown'
+  // Standardize slashes
+  const normalized = path.replace(/\\/g, '/')
+  
+  // Extract project-relative path by stripping out the temporary scan directory
+  // e.g. /tmp/vibeguard_scans/14c6920f-108d-49d2-a8e6-.../backend/auth.py
+  // or C:/Users/HP/AppData/Local/Temp/vibeguard_scans/.../backend/auth.py
+  const match = normalized.match(/vibeguard_scans\/[0-9a-fA-F-]+\/(.+)$/)
+  if (match && match[1]) {
+    return match[1]
+  }
+  
+  return normalized
+}
+
+export function basename(path: string): string {
+  const parts = path.split('/')
+  return parts[parts.length - 1] || path
 }
 
 /* ------------------------------------------------------------------ */
@@ -341,10 +382,15 @@ export function classifySecurityAreas(finding: ApiFinding): SecurityArea[] {
 /*  Aggregation                                                        */
 /* ------------------------------------------------------------------ */
 
+interface FileBucket {
+  path: string
+  findings: GraphFindingDetail[]
+}
+
 interface AreaBucket {
   area: SecurityArea
   findingIds: string[]
-  files: Set<string>
+  fileBuckets: Map<string, FileBucket>
   severities: string[]
 }
 
@@ -356,12 +402,27 @@ function aggregateAreas(findings: ApiFinding[]): Map<SecurityArea, AreaBucket> {
     for (const area of areas) {
       let bucket = map.get(area)
       if (!bucket) {
-        bucket = { area, findingIds: [], files: new Set(), severities: [] }
+        bucket = { area, findingIds: [], fileBuckets: new Map(), severities: [] }
         map.set(area, bucket)
       }
+      
       bucket.findingIds.push(finding.id)
-      if (finding.file_path) bucket.files.add(finding.file_path)
       bucket.severities.push(finding.severity)
+
+      if (finding.file_path) {
+        const cleanPath = cleanFilePath(finding.file_path)
+        let fileBucket = bucket.fileBuckets.get(cleanPath)
+        if (!fileBucket) {
+          fileBucket = { path: cleanPath, findings: [] }
+          bucket.fileBuckets.set(cleanPath, fileBucket)
+        }
+        fileBucket.findings.push({
+          id: finding.id,
+          title: finding.title || 'Unknown vulnerability',
+          severity: finding.severity as SeverityLevel,
+          line: finding.line_number || null,
+        })
+      }
     }
   }
 
@@ -374,8 +435,8 @@ function aggregateAreas(findings: ApiFinding[]): Map<SecurityArea, AreaBucket> {
 
 /**
  * Position N nodes inside a 0-100 viewBox.
- * Uses an elliptical layout sorted alphabetically by area name
- * so the same set of areas always produces the same positions.
+ * Uses an elliptical layout sorted alphabetically by area name.
+ * Radii are reduced to leave room for child nodes.
  */
 function computeNodeLayout(sortedAreas: SecurityArea[]): Map<SecurityArea, { x: number; y: number }> {
   const positions = new Map<SecurityArea, { x: number; y: number }>()
@@ -397,8 +458,8 @@ function computeNodeLayout(sortedAreas: SecurityArea[]): Map<SecurityArea, { x: 
   // Elliptical distribution
   const cx = 50
   const cy = 50
-  const rx = 34  // horizontal radius
-  const ry = 30  // vertical radius
+  const rx = 30  // horizontal radius (reduced for child nodes)
+  const ry = 26  // vertical radius (reduced for child nodes)
 
   for (let i = 0; i < count; i++) {
     // Start from the top (-π/2) and go clockwise
@@ -415,18 +476,20 @@ function computeNodeLayout(sortedAreas: SecurityArea[]): Map<SecurityArea, { x: 
 /*  Edge generation                                                    */
 /* ------------------------------------------------------------------ */
 
-function generateEdges(presentAreas: Set<SecurityArea>, nodeMap: Map<SecurityArea, GraphNode>): GraphEdge[] {
+function generateEdges(presentAreas: Set<SecurityArea>, nodeMap: Map<string, GraphNode>): GraphEdge[] {
   const edges: GraphEdge[] = []
 
   for (const [a, b] of ADJACENCY_PAIRS) {
     if (presentAreas.has(a) && presentAreas.has(b)) {
-      const nodeA = nodeMap.get(a)
-      const nodeB = nodeMap.get(b)
+      const idA = a.toLowerCase().replace(/\s+/g, '-')
+      const idB = b.toLowerCase().replace(/\s+/g, '-')
+      const nodeA = nodeMap.get(idA)
+      const nodeB = nodeMap.get(idB)
       const aHigh = nodeA && (nodeA.highestSeverity === 'CRITICAL' || nodeA.highestSeverity === 'HIGH')
       const bHigh = nodeB && (nodeB.highestSeverity === 'CRITICAL' || nodeB.highestSeverity === 'HIGH')
       edges.push({
-        from: a.toLowerCase().replace(/\s+/g, '-'),
-        to: b.toLowerCase().replace(/\s+/g, '-'),
+        from: idA,
+        to: idB,
         active: !!(aHigh || bHigh),
       })
     }
@@ -441,7 +504,7 @@ function generateEdges(presentAreas: Set<SecurityArea>, nodeMap: Map<SecurityAre
 
 /**
  * Build a complete graph from an array of findings.
- * Returns an empty graph (no nodes, no edges) when there are no findings.
+ * Generates Parent (Area) nodes and Child (File) nodes.
  */
 export function buildGraphFromFindings(findings: ApiFinding[]): GraphData {
   if (!findings || findings.length === 0) {
@@ -454,18 +517,23 @@ export function buildGraphFromFindings(findings: ApiFinding[]): GraphData {
   // 2. Sort areas alphabetically for deterministic layout
   const sortedAreas = (Array.from(areaBuckets.keys()) as SecurityArea[]).sort()
 
-  // 3. Compute positions
+  // 3. Compute parent positions
   const positions = computeNodeLayout(sortedAreas)
 
-  // 4. Build nodes
-  const nodeMap = new Map<SecurityArea, GraphNode>()
+  // 4. Build nodes and parent-child edges
+  const nodeMap = new Map<string, GraphNode>()
   const nodes: GraphNode[] = []
+  const edges: GraphEdge[] = []
 
   for (const area of sortedAreas) {
     const bucket = areaBuckets.get(area)!
     const pos = positions.get(area)!
-    const node: GraphNode = {
-      id: area.toLowerCase().replace(/\s+/g, '-'),
+    const parentId = area.toLowerCase().replace(/\s+/g, '-')
+    
+    // Create Parent Node
+    const parentNode: GraphNode = {
+      id: parentId,
+      type: 'area',
       label: area,
       kind: AREA_KIND[area],
       x: pos.x,
@@ -473,15 +541,62 @@ export function buildGraphFromFindings(findings: ApiFinding[]): GraphData {
       vulnerabilityCount: bucket.findingIds.length,
       highestSeverity: calculateHighestSeverity(bucket.severities),
       vulnerabilities: bucket.findingIds,
-      files: Array.from(bucket.files),
+      files: Array.from(bucket.fileBuckets.keys()),
     }
-    nodeMap.set(area, node)
-    nodes.push(node)
+    nodeMap.set(parentId, parentNode)
+    nodes.push(parentNode)
+
+    // Create Child (File) Nodes
+    const files = Array.from(bucket.fileBuckets.values()).sort((a, b) => a.path.localeCompare(b.path))
+    const fileCount = files.length
+    
+    // Radial distribution for children around the parent
+    const childRadius = 8 + (fileCount > 5 ? (fileCount - 5) : 0) // Expand radius slightly if many files
+
+    files.forEach((fileBucket, index) => {
+      // Start child angle based on position to fan outwards
+      const angle = (2 * Math.PI * index) / fileCount
+      const cx = pos.x + childRadius * Math.cos(angle)
+      const cy = pos.y + childRadius * Math.sin(angle)
+
+      const childSeverities = fileBucket.findings.map(f => f.severity)
+      const childHighestSev = calculateHighestSeverity(childSeverities)
+      
+      const childId = `${parentId}-${fileBucket.path.replace(/[^a-zA-Z0-9]/g, '-')}`
+      
+      const childNode: GraphNode = {
+        id: childId,
+        type: 'file',
+        label: basename(fileBucket.path),
+        kind: 'FILE',
+        x: Math.round(cx * 10) / 10,
+        y: Math.round(cy * 10) / 10,
+        vulnerabilityCount: fileBucket.findings.length,
+        highestSeverity: childHighestSev,
+        vulnerabilities: fileBucket.findings.map(f => f.id),
+        parentId: parentId,
+        fullPath: fileBucket.path,
+        findingsDetails: fileBucket.findings,
+      }
+      
+      nodeMap.set(childId, childNode)
+      nodes.push(childNode)
+      
+      // Parent -> Child Edge
+      edges.push({
+        from: parentId,
+        to: childId,
+        active: childHighestSev === 'CRITICAL' || childHighestSev === 'HIGH',
+        isHierarchy: true,
+      })
+    })
   }
 
-  // 5. Build edges
+  // 5. Build area-to-area logical edges
   const presentAreas = new Set(sortedAreas)
-  const edges = generateEdges(presentAreas, nodeMap)
+  const logicalEdges = generateEdges(presentAreas, nodeMap)
+  
+  edges.push(...logicalEdges)
 
   return { nodes, edges }
 }
